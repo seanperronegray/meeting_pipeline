@@ -18,7 +18,8 @@ import argparse
 import sys
 from typing import Optional, Sequence
 
-from .database import Database
+from .analysis import MeetingAnalyzer
+from .database import REVIEW_STATES, Database
 from .dedup import DedupConfig, Deduplicator
 from .localview import LocalViewImporter, LocalViewStandardizer
 from .meetingbank import MeetingBankImporter, MeetingBankStandardizer
@@ -88,6 +89,64 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    with Database(args.db) as db:
+        summary = MeetingAnalyzer().run(
+            db,
+            prompt_name=args.name,
+            prompt_text=args.prompt,
+            description=args.description,
+        )
+        print(
+            f"run {summary.run_id} for prompt {summary.prompt_name!r} "
+            f"(model={summary.model}, exemplars={summary.exemplar_count})"
+        )
+        print(
+            f"  scanned {summary.meetings_scanned} meetings, "
+            f"{summary.matches} matches"
+        )
+    return 0
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    with Database(args.db) as db:
+        findings = MeetingAnalyzer().report(
+            db, prompt_name=args.name, run_id=args.run,
+        )
+        if not findings:
+            print("no findings")
+            return 0
+        print(
+            f"{len(findings)} finding(s) for prompt "
+            f"{args.name or 'run=' + str(args.run)}"
+        )
+        for f in findings:
+            loc = f.get("municipality") or "?"
+            state = f.get("state") or ""
+            fips = f.get("fips_code") or "-"
+            date = f.get("meeting_date") or "?"
+            conf = f.get("confidence") or 0.0
+            status = f.get("review_status") or "unreviewed"
+            print(
+                f"  [{f['finding_id']}] {loc}, {state} ({fips}) "
+                f"{date}  conf={conf:.3f}  review={status}"
+            )
+            if f.get("summary"):
+                print(f"      summary: {f['summary']}")
+            for q in f.get("quotes") or []:
+                print(f"      quote:   {q}")
+    return 0
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    with Database(args.db) as db:
+        MeetingAnalyzer().review(
+            db, args.finding_id, args.status, reviewer=args.reviewer,
+        )
+        print(f"finding {args.finding_id} -> {args.status}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pipeline", description=__doc__)
     parser.add_argument("--db", default="pipeline.db", help="SQLite DB path")
@@ -111,6 +170,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stats = sub.add_parser("stats", help="row counts per layer")
     p_stats.set_defaults(func=_cmd_stats)
+
+    p_analyze = sub.add_parser(
+        "analyze",
+        help="run a named prompt against every standardized meeting",
+    )
+    p_analyze.add_argument("--name", required=True,
+                           help="stable prompt identifier (created on first use)")
+    p_analyze.add_argument("--prompt", help="prompt text (required on first use)")
+    p_analyze.add_argument("--description", help="optional prompt description")
+    p_analyze.set_defaults(func=_cmd_analyze)
+
+    p_report = sub.add_parser("report", help="print findings for a prompt / run")
+    p_report.add_argument("--name", help="prompt name (uses latest run)")
+    p_report.add_argument("--run", type=int, help="specific analysis_run id")
+    p_report.set_defaults(func=_cmd_report)
+
+    p_review = sub.add_parser("review", help="set the human review field")
+    p_review.add_argument("finding_id", type=int)
+    p_review.add_argument("--status", required=True, choices=list(REVIEW_STATES))
+    p_review.add_argument("--reviewer")
+    p_review.set_defaults(func=_cmd_review)
 
     return parser
 

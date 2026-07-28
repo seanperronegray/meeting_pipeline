@@ -17,7 +17,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-from .models import DEDUPER_VERSION, Meeting, RawRecord
+from .models import ANALYZER_VERSION, DEDUPER_VERSION, Meeting, RawRecord
+
+# Review states for analysis findings. Kept as constants so the schema, the
+# analyzer, and the CLI all agree on the exact strings.
+REVIEW_UNREVIEWED = "unreviewed"
+REVIEW_CONFIRMED = "confirmed_match"
+REVIEW_INCORRECT = "incorrect_match"
+REVIEW_STATES = (REVIEW_UNREVIEWED, REVIEW_CONFIRMED, REVIEW_INCORRECT)
 
 SCHEMA = """
 -- ---------- Layer 1: RAW (immutable, one table per source) ----------
@@ -98,6 +105,54 @@ CREATE TABLE IF NOT EXISTS meeting_analysis (
     created_at       TEXT NOT NULL,
     FOREIGN KEY (meeting_id) REFERENCES meeting (id)
 );
+
+-- Named, reusable analysis prompts. Same prompt can be rerun as new meetings
+-- arrive or better models become available, and prior human reviews for the
+-- prompt carry forward as few-shot exemplars.
+CREATE TABLE IF NOT EXISTS analysis_prompt (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL UNIQUE,
+    prompt_text  TEXT NOT NULL,
+    description  TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+-- One row per execution of a prompt. Preserves the full run history so
+-- researchers can compare results across models / dataset versions.
+CREATE TABLE IF NOT EXISTS analysis_run (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt_id         INTEGER NOT NULL,
+    model             TEXT NOT NULL,
+    analyzer_version  TEXT NOT NULL,
+    exemplar_count    INTEGER NOT NULL DEFAULT 0,
+    meetings_scanned  INTEGER,
+    matches           INTEGER,
+    started_at        TEXT NOT NULL,
+    finished_at       TEXT,
+    FOREIGN KEY (prompt_id) REFERENCES analysis_prompt (id)
+);
+
+-- One row per (run, meeting) that the backend flagged. Human reviews land
+-- here; subsequent runs of the same prompt query this table for exemplars.
+CREATE TABLE IF NOT EXISTS analysis_finding (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER NOT NULL,
+    meeting_id     INTEGER NOT NULL,
+    is_match       INTEGER NOT NULL,          -- 0/1 boolean
+    summary        TEXT,
+    quotes         TEXT,                       -- JSON array of quote strings
+    confidence     REAL NOT NULL,
+    review_status  TEXT NOT NULL DEFAULT 'unreviewed',
+    reviewed_by    TEXT,
+    reviewed_at    TEXT,
+    created_at     TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES analysis_run (id),
+    FOREIGN KEY (meeting_id) REFERENCES meeting (id)
+);
+CREATE INDEX IF NOT EXISTS idx_finding_run ON analysis_finding (run_id);
+CREATE INDEX IF NOT EXISTS idx_finding_meeting ON analysis_finding (meeting_id);
+CREATE INDEX IF NOT EXISTS idx_finding_review ON analysis_finding (review_status);
 """
 
 # Maps a source name to its Layer 1 raw table. Extend this when adding sources.
@@ -279,6 +334,206 @@ class Database:
 
     def count_meetings(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM meeting").fetchone()[0]
+
+    # ---------- Layer 3: analysis prompts / runs / findings ----------
+
+    def upsert_prompt(
+        self,
+        name: str,
+        prompt_text: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Fetch or create a named prompt.
+
+        On first sight of ``name`` the prompt is created (``prompt_text`` is
+        required). On subsequent calls the stored prompt is returned; passing
+        ``prompt_text`` or ``description`` updates them (and refreshes
+        ``updated_at``) so callers can evolve wording without changing the
+        prompt's identity.
+        """
+        existing = self.conn.execute(
+            "SELECT * FROM analysis_prompt WHERE name = ?", (name,)
+        ).fetchone()
+        now = _utcnow()
+        if existing is None:
+            if not prompt_text:
+                raise ValueError(
+                    f"prompt {name!r} does not exist; provide prompt_text to create it"
+                )
+            with self.transaction() as conn:
+                cur = conn.execute(
+                    "INSERT INTO analysis_prompt "
+                    "(name, prompt_text, description, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (name, prompt_text, description, now, now),
+                )
+                pid = cur.lastrowid
+            return {
+                "id": pid, "name": name, "prompt_text": prompt_text,
+                "description": description, "created_at": now, "updated_at": now,
+            }
+        if prompt_text is not None or description is not None:
+            with self.transaction() as conn:
+                conn.execute(
+                    "UPDATE analysis_prompt SET prompt_text = COALESCE(?, prompt_text), "
+                    "description = COALESCE(?, description), updated_at = ? WHERE id = ?",
+                    (prompt_text, description, now, existing["id"]),
+                )
+            existing = self.conn.execute(
+                "SELECT * FROM analysis_prompt WHERE id = ?", (existing["id"],)
+            ).fetchone()
+        return dict(existing)
+
+    def get_prompt(self, name: str) -> Optional[dict[str, Any]]:
+        """Fetch a prompt row by name, or ``None`` if it doesn't exist."""
+        row = self.conn.execute(
+            "SELECT * FROM analysis_prompt WHERE name = ?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def iter_reviewed_findings(
+        self, prompt_id: int
+    ) -> Iterator[dict[str, Any]]:
+        """Reviewed findings for a prompt — the pool of few-shot exemplars.
+
+        Returns every finding whose ``review_status`` has been set by a human,
+        across all prior runs of the prompt.
+        """
+        cur = self.conn.execute(
+            """
+            SELECT f.id, f.run_id, f.meeting_id, f.is_match, f.summary,
+                   f.quotes, f.confidence, f.review_status,
+                   f.reviewed_by, f.reviewed_at
+            FROM analysis_finding f
+            JOIN analysis_run r ON f.run_id = r.id
+            WHERE r.prompt_id = ?
+              AND f.review_status IN (?, ?)
+            ORDER BY f.reviewed_at
+            """,
+            (prompt_id, REVIEW_CONFIRMED, REVIEW_INCORRECT),
+        )
+        for row in cur:
+            d = dict(row)
+            d["quotes"] = json.loads(d["quotes"]) if d["quotes"] else []
+            yield d
+
+    def create_analysis_run(
+        self, prompt_id: int, model: str, exemplar_count: int = 0
+    ) -> int:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "INSERT INTO analysis_run "
+                "(prompt_id, model, analyzer_version, exemplar_count, started_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (prompt_id, model, ANALYZER_VERSION, exemplar_count, _utcnow()),
+            )
+            return cur.lastrowid
+
+    def save_finding(
+        self,
+        run_id: int,
+        meeting_id: int,
+        is_match: bool,
+        summary: Optional[str],
+        quotes: Iterable[str],
+        confidence: float,
+    ) -> int:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO analysis_finding
+                    (run_id, meeting_id, is_match, summary, quotes,
+                     confidence, review_status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id, meeting_id, int(bool(is_match)), summary,
+                    json.dumps(list(quotes), ensure_ascii=False),
+                    float(confidence), REVIEW_UNREVIEWED, _utcnow(),
+                ),
+            )
+            return cur.lastrowid
+
+    def finalize_run(
+        self, run_id: int, meetings_scanned: int, matches: int
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE analysis_run SET meetings_scanned = ?, matches = ?, "
+                "finished_at = ? WHERE id = ?",
+                (meetings_scanned, matches, _utcnow(), run_id),
+            )
+
+    def latest_run_id(self, prompt_id: int) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT id FROM analysis_run WHERE prompt_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (prompt_id,),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def iter_findings_report(
+        self,
+        prompt_id: Optional[int] = None,
+        run_id: Optional[int] = None,
+        matches_only: bool = True,
+    ) -> Iterator[dict[str, Any]]:
+        """Report rows joining findings with their meeting for display.
+
+        Emits municipality, meeting_date, summary, quotes, confidence and
+        review_status per finding — the report the user asked for.
+        """
+        clauses = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("f.run_id = ?")
+            params.append(run_id)
+        elif prompt_id is not None:
+            clauses.append("r.prompt_id = ?")
+            params.append(prompt_id)
+        if matches_only:
+            clauses.append("f.is_match = 1")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cur = self.conn.execute(
+            f"""
+            SELECT f.id AS finding_id, f.run_id, f.meeting_id,
+                   f.is_match, f.summary, f.quotes, f.confidence,
+                   f.review_status, f.reviewed_by, f.reviewed_at,
+                   m.municipality, m.state, m.meeting_date, m.meeting_name,
+                   m.source, m.source_id, m.fips_code,
+                   r.prompt_id, r.model
+            FROM analysis_finding f
+            JOIN analysis_run r ON f.run_id = r.id
+            JOIN meeting m ON f.meeting_id = m.id
+            {where}
+            ORDER BY f.confidence DESC, m.meeting_date DESC
+            """,
+            params,
+        )
+        for row in cur:
+            d = dict(row)
+            d["is_match"] = bool(d["is_match"])
+            d["quotes"] = json.loads(d["quotes"]) if d["quotes"] else []
+            yield d
+
+    def set_review_status(
+        self,
+        finding_id: int,
+        status: str,
+        reviewer: Optional[str] = None,
+    ) -> None:
+        if status not in REVIEW_STATES:
+            raise ValueError(
+                f"invalid review status {status!r}; must be one of {REVIEW_STATES}"
+            )
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE analysis_finding SET review_status = ?, "
+                "reviewed_by = ?, reviewed_at = ? WHERE id = ?",
+                (status, reviewer, _utcnow(), finding_id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"no analysis_finding with id {finding_id}")
 
     # ---------- Layer 3: dedup writes ----------
 

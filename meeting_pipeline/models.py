@@ -23,6 +23,9 @@ from .fips import resolve_fips
 # now encodes the resolution level (2 = state, 5 = county, 7 = municipal).
 STANDARDIZER_VERSION = "1.2.0"
 DEDUPER_VERSION = "1.2.0"
+# Analyzer version stamped on every analysis_run row so researchers can filter
+# by orchestrator generation independently of the chosen model/backend.
+ANALYZER_VERSION = "1.0.0"
 
 
 @dataclass

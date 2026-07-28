@@ -18,11 +18,16 @@ improve — without ever re-importing.
                     │                             one table per source,
                     │                             raw JSON, never edited
                     ▼
-        Standardizers (deterministic)         ─► Layer 2: STANDARDIZED
-                    │                             single `meeting` schema
+        Standardizers (deterministic,         ─► Layer 2: STANDARDIZED
+                       FIPS-tagged)              single `meeting` schema
+                    │
                     ▼
         Deduplicator (3-stage cascade)        ─► Layer 3: RESEARCH
-                    │                             canonical_meeting (+ analysis)
+                    │                             canonical_meeting
+                    ▼
+        Analyzer (pluggable LLM/heuristic,     ─► Layer 3: RESEARCH
+                  learns from prior reviews)     analysis_prompt / run / finding
+                    │
                     ▼
         Published research dataset
 ```
@@ -57,6 +62,35 @@ The default embedding backend is a dependency-free deterministic hashing
 embedding, so the whole pipeline runs and tests reproducibly with **zero
 external dependencies or API keys**. Swap in `sentence-transformers` (or any
 `EmbeddingBackend`) for production, and pass any `llm_adjudicator` callable.
+
+## Analysis: prompted findings that improve over time
+
+The analyzer runs a natural-language question against every standardized
+meeting and stores a per-meeting finding: municipality, meeting date, action
+summary, supporting quotes, confidence, and a human review field
+(`unreviewed | confirmed_match | incorrect_match`).
+
+- **Prompts are named and stored** (`analysis_prompt` table), so the same
+  question can be rerun as new meetings arrive or better models become
+  available — the prompt keeps its identity across runs.
+- **Every execution is a new `analysis_run`**, preserving history for
+  side-by-side comparison across models and dataset versions.
+- **Each rerun consumes prior reviews as few-shot exemplars.** Confirmed
+  matches expand the analyzer's positive term set; rejected matches trim it.
+  So false-negative and false-positive rates fall as reviewers work through
+  the backlog.
+
+The default `KeywordAnalyzer` is deterministic and zero-dependency. Swap in
+an LLM backend by subclassing `AnalysisBackend` — the orchestrator stays the
+same.
+
+```bash
+pipeline analyze --name sea-level-rise \
+    --prompt "what actions have been taken to mitigate global sea level rise"
+pipeline report --name sea-level-rise
+pipeline review 42 --status confirmed_match --reviewer alice
+pipeline analyze --name sea-level-rise    # rerun; loads alice's reviews
+```
 
 ## Install
 
