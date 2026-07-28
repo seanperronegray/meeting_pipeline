@@ -310,3 +310,84 @@ def test_analyzer_backend_is_pluggable(db):
     )
     assert summary.model == "stub"
     assert summary.matches == summary.meetings_scanned
+
+
+
+# ---------- source-specific: real dataset shapes ----------
+
+def test_meetingbank_standardizes_real_huggingface_shape(db):
+    """The HuggingFace release omits city/state/date — they live in `uid`."""
+    records = [
+        # A Seattle segment as it appears in huuuyeah/meetingbank.
+        {"id": 0,
+         "uid": "SeattleCityCouncil_06132016_Res 31669",
+         "summary": "A RESOLUTION encouraging as a best practice ...",
+         "transcript": "The report of the Civil Rights, Utilities, Economic Development ..."},
+        # A Long Beach segment.
+        {"id": 1,
+         "uid": "LongBeachCC_08092022_22-0946",
+         "summary": "Public hearing budget overview.",
+         "transcript": "Thank you. Speaker 7: All right ..."},
+    ]
+    MeetingBankImporter(records=records).run(db)
+    MeetingBankStandardizer().run(db)
+
+    rows = list(db.iter_meetings())
+    assert len(rows) == 2
+    by_uid = {r["source_id"]: dict(r) for r in rows}
+
+    seattle = by_uid["SeattleCityCouncil_06132016_Res 31669"]
+    assert seattle["municipality"] == "Seattle"
+    assert seattle["state"] == "WA"
+    assert seattle["meeting_date"] == "2016-06-13"
+    assert seattle["meeting_name"] == "Res 31669"
+    assert "Civil Rights" in seattle["transcript"]
+    # `summary` maps into the canonical `minutes` field.
+    assert seattle["minutes"].startswith("A RESOLUTION")
+    # FIPS resolution wires up automatically via the __post_init__ resolver.
+    assert seattle["fips_code"] == "53033"       # WA + King County
+
+    long_beach = by_uid["LongBeachCC_08092022_22-0946"]
+    assert long_beach["municipality"] == "Long Beach"
+    assert long_beach["state"] == "CA"
+    assert long_beach["meeting_date"] == "2022-08-09"
+
+
+def test_meetingbank_uid_parser_edge_cases():
+    """Direct unit test for the uid parser's failure modes."""
+    from meeting_pipeline.meetingbank import MeetingBankStandardizer
+
+    p = MeetingBankStandardizer._parse_uid
+    # Unknown prefix -> no place, but date and item still parsed.
+    muni, state, date, item = p("PortlandCC_04052021_42")
+    assert muni is None and state is None
+    assert date == "2021-04-05"
+    assert item == "42"
+    # Invalid calendar date -> None.
+    muni, state, date, item = p("SeattleCityCouncil_13322020_x")
+    assert date is None
+    # No item id.
+    muni, state, date, item = p("BostonCityCouncil_01152020")
+    assert muni == "Boston" and state == "MA" and date == "2020-01-15" and item is None
+    # Malformed -> all None.
+    assert p("") == (None, None, None, None)
+    assert p("garbage") == (None, None, None, None)
+
+
+def test_localview_accepts_numeric_state_fips(db):
+    """LocalView's ``state_fips`` (2-digit numeric) must resolve to a state."""
+    records = [{
+        "vid_id": "abc123",
+        "place_name": "Seattle",
+        "state_fips": "53",                      # WA
+        "date_uploaded": "2022-11-04",
+        "title": "Regular Council Meeting",
+        "caption_text_pipe": "call to order ...",
+    }]
+    LocalViewImporter(records=records).run(db)
+    LocalViewStandardizer().run(db)
+    row = dict(next(db.iter_meetings()))
+    assert row["municipality"] == "Seattle"
+    assert row["meeting_date"] == "2022-11-04"
+    assert row["state_fips"] == "53"
+    assert row["fips_code"] == "53033"          # WA + King County

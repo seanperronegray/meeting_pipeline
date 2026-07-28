@@ -63,6 +63,97 @@ embedding, so the whole pipeline runs and tests reproducibly with **zero
 external dependencies or API keys**. Swap in `sentence-transformers` (or any
 `EmbeddingBackend`) for production, and pass any `llm_adjudicator` callable.
 
+## Data sources
+
+The importers read local JSON/JSONL files. They do not fetch anything over the
+network — that's a deliberate design choice so runs are reproducible and
+offline-friendly. You download the source data once, then point the importer
+at it.
+
+### MeetingBank
+
+MeetingBank (Hu et al., ACL 2023, [arxiv:2305.17529](https://arxiv.org/abs/2305.17529))
+is a benchmark of ~1,366 city council meetings across six U.S. municipalities:
+**Alameda**, **Boston**, **Denver**, **King County (WA)**, **Long Beach**, and
+**Seattle**. Each row is a *segment* of a meeting with a human-written summary
+and full transcript.
+
+Canonical release:
+[`huuuyeah/meetingbank` on Hugging Face](https://huggingface.co/datasets/huuuyeah/meetingbank)
+(CC-BY-NC-SA 4.0). Audio and PDFs live in a companion release; this pipeline
+only consumes the text.
+
+**Fetch the JSONL** — one line per segment, using the `datasets` library:
+
+```python
+from datasets import load_dataset
+ds = load_dataset("huuuyeah/meetingbank", split="train")
+ds.to_json("meetingbank.jsonl", lines=True)
+```
+
+Each line ends up shaped like:
+
+```json
+{
+  "id": 0,
+  "uid": "SeattleCityCouncil_06132016_Res 31669",
+  "summary": "A RESOLUTION encouraging ...",
+  "transcript": "The report of the Civil Rights, Utilities, ..."
+}
+```
+
+Note: the raw payload does **not** carry `city`, `state`, or `date` fields —
+those are packed inside `uid` (`{PlacePrefix}_{MMDDYYYY}_{ItemId}`). The
+`MeetingBankStandardizer` unpacks them for you, and `summary` maps onto the
+canonical `minutes` field (it's a summary of the meeting minutes). Run:
+
+```bash
+pipeline import meetingbank --path meetingbank.jsonl
+pipeline standardize meetingbank
+```
+
+### LocalView
+
+LocalView (Barari & Simko, [*Scientific Data* 2023](https://www.nature.com/articles/s41597-023-02044-y),
+data at [localview.net](https://localview.net/)) is ~140,000 U.S. local
+government meeting videos sourced from YouTube, with auto-generated captions
+serving as transcripts. Coverage: 1,012 places and 2,861 governments,
+2006–2022. If you want breadth across small and mid-sized municipalities,
+this is the one.
+
+**Fetch the data** from the LocalView download page (registration free; the
+data is published as CSV/RDS on the project site and on Harvard Dataverse).
+Convert to JSONL. Any of these column names will be picked up by the
+`LocalViewStandardizer`:
+
+| Canonical field | Accepted source keys                                     |
+| --------------- | -------------------------------------------------------- |
+| `source_id`     | `id` / `video_id` / `vid_id` / `meeting_id`              |
+| `meeting_date`  | `date` / `meeting_date` / `date_uploaded` / `upload_date` / `published_at` |
+| `municipality`  | `place_name` / `place` / `locality` / `city`             |
+| `state`         | `state` / `state_name` / `state_abbr` / `state_fips` (numeric 2-digit) |
+| `meeting_name`  | `title` / `meeting_name` / `caption`                     |
+| `transcript`    | `caption_text_pipe` / `transcript` / `captions` / `text` |
+| `video_url`     | `video_url` / `youtube_url` / `url`                      |
+| `latitude`      | `lat` / `latitude`                                       |
+| `longitude`     | `lon` / `longitude`                                      |
+
+Unknown keys are preserved verbatim in the raw layer, so a future
+standardizer revision can pick them up without a re-import. Run:
+
+```bash
+pipeline import localview --path localview.jsonl
+pipeline standardize localview
+```
+
+### Adding another source
+
+Same three-step recipe as MeetingBank and LocalView:
+1. Subclass `BaseImporter` (set `source`, implement `fetch()`).
+2. Subclass `BaseStandardizer` (map the raw payload onto `Meeting`).
+3. Register the raw table in `database.RAW_TABLES` and the classes in the
+   CLI registries.
+
 ## Analysis: prompted findings that improve over time
 
 The analyzer runs a natural-language question against every standardized
@@ -125,13 +216,6 @@ with Database("pipeline.db") as db:
     summaries = Deduplicator(DedupConfig(date_tolerance_days=1)).run(db)  # L3
 ```
 
-## Adding a new source
-
-1. Subclass `BaseImporter` (set `source`, implement `fetch()`).
-2. Subclass `BaseStandardizer` (map the raw payload onto `Meeting`).
-3. Register the raw table in `database.RAW_TABLES` and the classes in the CLI
-   registries.
-
 ## Layout
 
 ```
@@ -153,5 +237,5 @@ tests/
 ## Tests
 
 ```bash
-pytest -q     # 10 passing
+pytest -q     # 19 passing
 ```

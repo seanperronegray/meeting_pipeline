@@ -151,11 +151,18 @@ def _normalize_state(state: Optional[str]) -> Optional[str]:
     if not text:
         return None
     # Two-letter code?
-    if len(text) == 2 and text.upper() in STATE_FIPS:
-        return text.upper()
+    upper = text.upper()
+    # Two-letter code?
+    if len(text) == 2 and upper in STATE_FIPS:
+        return upper
+    # Two-digit numeric FIPS code (some datasets, LocalView included, store
+    # ``state_fips`` as a raw string like ``"53"`` for Washington)?
+    if len(text) == 2 and text.isdigit():
+        for abbrev, fips in STATE_FIPS.items():
+            if fips == text:
+                return abbrev
     # Full name?
-    abbrev = STATE_NAME_TO_ABBREV.get(text.lower())
-    return abbrev
+    return STATE_NAME_TO_ABBREV.get(text.lower())
 
 
 @dataclass(frozen=True)
