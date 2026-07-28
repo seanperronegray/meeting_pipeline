@@ -1,0 +1,7 @@
+# Core pipeline has NO runtime dependencies — it uses only the Python standard
+# library (sqlite3, dataclasses, difflib, hashlib). This keeps imports and
+# standardization fully reproducible with zero setup.
+#
+# Optional extras (install as needed):
+#   sentence-transformers>=2.2   # real embeddings for the dedup similarity pass
+#   pytest>=7.0                  # test suite

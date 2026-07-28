@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meeting-research-pipeline"
+version = "0.1.0"
+description = "Reproducible ETL pipeline for municipal meeting research data"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+# The core package has zero runtime deps and uses a built-in hashing embedding.
+# Install these to plug in real transformer embeddings / LLM adjudication.
+embeddings = ["sentence-transformers>=2.2"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+pipeline = "meeting_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["meeting_pipeline*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
