@@ -1,0 +1,70 @@
+# ---------- macOS ----------
+.DS_Store
+
+# ---------- Python: bytecode / caches ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ---------- Python: packaging / build ----------
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+
+# ---------- Python: virtual environments ----------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ---------- Test / coverage tooling ----------
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# ---------- Editors / IDEs ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------- Jupyter ----------
+.ipynb_checkpoints/
+
+# ---------- Pipeline artifacts ----------
+# The SQLite database is a derived artifact — every layer downstream of raw
+# can be rebuilt by re-running the pipeline, and the DB itself will typically
+# hold research data that shouldn't be in version control.
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Local data: raw dataset dumps live outside version control. Keep any
+# .gitkeep placeholder inside data/ if we want the folder to exist.
+data/
+!data/.gitkeep
+
+# Logs / build output from brazil-build helpers etc.
+*.log
+build.log
+
+# Environment / secrets — never check these in.
+.env
+.env.*
+!.env.example
